@@ -83,17 +83,59 @@ class TestMem0FiltersV2:
         assert client.captured_search["filters"] == {"user_id": "u123"}
         assert "user_id" not in {k for k in client.captured_search if k != "filters"}
 
-    def test_sync_turn_uses_write_filters(self, monkeypatch):
+    def test_sync_turn_buffers_without_writing(self, monkeypatch):
+        """sync_turn only buffers — no add() until a flush trigger fires."""
         client = FakeClientV2()
         provider = self._make_provider(monkeypatch, client)
 
         provider.sync_turn("user said this", "assistant replied", session_id="s1")
+
+        assert client.captured_add == []          # nothing written yet
+        assert len(provider._session_batch) == 2  # buffered
+
+    def test_flush_on_session_end_uses_write_filters_and_infer_true(self, monkeypatch):
+        """Flushing the buffer writes the whole session with infer=True."""
+        client = FakeClientV2()
+        provider = self._make_provider(monkeypatch, client)
+
+        provider.sync_turn("user said this", "assistant replied", session_id="s1")
+        provider.on_session_end([])
         provider._sync_thread.join(timeout=2)
 
         assert len(client.captured_add) == 1
         call = client.captured_add[0]
         assert call["user_id"] == "u123"
         assert call["agent_id"] == "hermes"
+        assert call["infer"] is True
+        assert len(call["messages"]) == 2         # both turns batched
+        assert provider._session_batch == []       # buffer drained
+
+    def test_flush_on_session_switch(self, monkeypatch):
+        """Any session switch (incl. compression rotation) flushes the buffer."""
+        client = FakeClientV2()
+        provider = self._make_provider(monkeypatch, client)
+
+        provider.sync_turn("a", "b", session_id="s1")
+        provider.on_session_switch("s2", parent_session_id="s1", reset=False)
+        provider._sync_thread.join(timeout=2)
+
+        assert len(client.captured_add) == 1
+        assert provider._session_id == "s2"
+        assert provider._session_batch == []
+
+    def test_buffer_cap_auto_flushes(self, monkeypatch):
+        """A never-rotating session flushes at the buffer cap."""
+        from plugins.memory import mem0 as mem0_mod
+        client = FakeClientV2()
+        provider = self._make_provider(monkeypatch, client)
+        monkeypatch.setattr(mem0_mod, "_FLUSH_CAP_MESSAGES", 4)
+
+        for _ in range(2):  # 2 turns = 4 messages = cap
+            provider.sync_turn("u", "a", session_id="s1")
+        provider._sync_thread.join(timeout=2)
+
+        assert len(client.captured_add) == 1
+        assert provider._session_batch == []
 
     def test_conclude_uses_write_filters(self, monkeypatch):
         client = FakeClientV2()

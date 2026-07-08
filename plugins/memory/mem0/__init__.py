@@ -33,6 +33,65 @@ logger = logging.getLogger(__name__)
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
+# Session batching: accumulate turns in a RAM buffer and flush to the
+# extraction LLM on session boundaries (switch / end / shutdown) instead of
+# every turn. Cuts per-turn extraction-LLM load (~N× fewer relay calls) while
+# keeping quality — the LLM sees the whole session at once. On Fly the VM is
+# suspended (frozen to RAM), not killed, so the buffer survives idle sleep.
+# Backstop flush when a session never rotates (slow drip / no compression):
+_FLUSH_CAP_MESSAGES = 80  # ~40 turns
+
+# Prefetch cadence: run semantic search every Nth turn, not every turn — each
+# search embeds the query on the user's OpenRouter key directly (the relay
+# serves no embedding models), so per-turn search is a direct provider cost.
+_DEFAULT_PREFETCH_CADENCE = 3
+
+# Trivial prompts that don't warrant a memory search.
+_TRIVIAL_PROMPTS = {
+    "да", "нет", "ок", "окей", "ага", "угу", "спасибо", "пасибо", "спс",
+    "ok", "okay", "yes", "no", "yep", "nope", "thanks", "thx", "ty", "+",
+}
+
+
+def _is_trivial_prompt(query: str) -> bool:
+    """True for empty/slash/very-short/acknowledgement prompts — skip search."""
+    s = (query or "").strip().lower()
+    if not s or s.startswith("/") or len(s) <= 3:
+        return True
+    return s in _TRIVIAL_PROMPTS
+
+
+# One-time rotating-file handler for batching debug traces, capped at ~10 MB
+# (5 MB active + 1 backup) so it never grows unbounded on the VM.
+_batch_log_ready = False
+
+
+def _setup_batch_logger() -> None:
+    global _batch_log_ready
+    if _batch_log_ready:
+        return
+    try:
+        from logging.handlers import RotatingFileHandler
+        from hermes_constants import get_hermes_home
+
+        log_dir = get_hermes_home() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            str(log_dir / "mem0-batch.log"),
+            maxBytes=5 * 1024 * 1024,  # 5 MB per file
+            backupCount=1,             # + 1 backup → ~10 MB hard ceiling
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False  # don't duplicate into the agent's stdout log
+        _batch_log_ready = True
+    except Exception:
+        # Logging setup must never break memory.
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -53,8 +112,9 @@ def _load_config() -> dict:
         "host": os.environ.get("MEM0_HOST", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
-        "rerank": True,
+        "rerank": False,
         "keyword_search": False,
+        "prefetch_cadence": _DEFAULT_PREFETCH_CADENCE,
     }
 
     config_path = get_hermes_home() / "mem0.json"
@@ -139,6 +199,12 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._sync_thread = None
+        # Session batching state
+        self._session_id = ""
+        self._session_batch: List[Dict[str, Any]] = []
+        self._batch_lock = threading.Lock()
+        self._prefetch_cadence = _DEFAULT_PREFETCH_CADENCE
+        self._turn_count = 0
         # Circuit breaker state
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
@@ -174,7 +240,8 @@ class Mem0MemoryProvider(MemoryProvider):
             {"key": "host", "description": "Self-hosted Mem0 URL (e.g. http://localhost:24220)", "default": "", "env_var": "MEM0_HOST"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
-            {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
+            {"key": "rerank", "description": "Enable reranking for recall (extra call per search)", "default": "false", "choices": ["true", "false"]},
+            {"key": "prefetch_cadence", "description": "Run memory search every Nth turn (1 = every turn)", "default": str(_DEFAULT_PREFETCH_CADENCE)},
         ]
 
     def _get_client(self):
@@ -227,7 +294,19 @@ class Mem0MemoryProvider(MemoryProvider):
         # fall back to config/env default for CLI (single-user) sessions.
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
-        self._rerank = self._config.get("rerank", True)
+        self._rerank = self._config.get("rerank", False)
+        try:
+            self._prefetch_cadence = max(1, int(
+                self._config.get("prefetch_cadence", _DEFAULT_PREFETCH_CADENCE)
+            ))
+        except (TypeError, ValueError):
+            self._prefetch_cadence = _DEFAULT_PREFETCH_CADENCE
+        self._session_id = session_id or ""
+        _setup_batch_logger()
+        logger.info(
+            "mem0 initialized: session=%s user=%s cadence=%d rerank=%s",
+            self._session_id, self._user_id, self._prefetch_cadence, self._rerank,
+        )
 
     def _read_filters(self) -> Dict[str, Any]:
         """Filters for search/get_all — scoped to user only for cross-session recall."""
@@ -269,6 +348,19 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._is_breaker_open():
             return
 
+        # Cadence gate: search on turns 1, 1+N, 1+2N, … — skip the rest so we
+        # don't embed the query on the user's OpenRouter key every turn.
+        self._turn_count += 1
+        if self._prefetch_cadence > 1 and (self._turn_count - 1) % self._prefetch_cadence != 0:
+            logger.debug(
+                "mem0 prefetch skipped: cadence gate (turn=%d, cadence=%d)",
+                self._turn_count, self._prefetch_cadence,
+            )
+            return
+        if _is_trivial_prompt(query):
+            logger.debug("mem0 prefetch skipped: trivial prompt")
+            return
+
         def _run():
             try:
                 client = self._get_client()
@@ -291,29 +383,94 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        """Buffer the turn; extraction is batched and flushed on session
+        boundaries (switch / end / shutdown / buffer-cap), not per turn.
+
+        This is the load fix: instead of one extraction-LLM call per turn, the
+        whole session is sent to the extraction LLM once, on a boundary. The
+        LLM sees the full conversation → cleaner deduped facts, ~N× fewer calls.
+        """
+        if session_id:
+            self._session_id = session_id
+        with self._batch_lock:
+            self._session_batch.append({"role": "user", "content": user_content})
+            self._session_batch.append({"role": "assistant", "content": assistant_content})
+            size = len(self._session_batch)
+        logger.debug(
+            "mem0 buffer: +2 msg → %d total (session=%s)", size, self._session_id
+        )
+        # Backstop: a session that never rotates (slow drip, no compression)
+        # would grow the buffer unbounded — flush at the cap.
+        if size >= _FLUSH_CAP_MESSAGES:
+            logger.info("mem0 buffer cap hit (%d msg) → flush", size)
+            self._flush_session("buffer-cap")
+
+    def _flush_session(self, trigger: str) -> None:
+        """Drain the session buffer to the extraction LLM (non-blocking).
+
+        Called on session boundaries. ``trigger`` labels the cause for debug
+        traces. Buffer is preserved (not dropped) when the breaker is open, so
+        the next trigger retries.
+        """
         if self._is_breaker_open():
+            logger.warning("mem0 flush deferred: breaker open (trigger=%s)", trigger)
             return
+        with self._batch_lock:
+            if not self._session_batch:
+                logger.debug("mem0 flush skipped: empty buffer (trigger=%s)", trigger)
+                return
+            batch = self._session_batch
+            self._session_batch = []
+            session_id = self._session_id
+        n = len(batch)
+        logger.info(
+            "mem0 flush: %d msg → extraction (trigger=%s, session=%s)",
+            n, trigger, session_id,
+        )
 
         def _sync():
             try:
                 client = self._get_client()
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]
-                client.add(messages, **self._write_filters())
+                # infer=True: server-side extraction over the whole session →
+                # clean deduped facts (not verbatim raw turns).
+                client.add(batch, **self._write_filters(), infer=True)
                 self._record_success()
+                logger.info("mem0 flush ok: %d msg written (trigger=%s)", n, trigger)
             except Exception as e:
                 self._record_failure()
-                logger.warning("Mem0 sync failed: %s", e)
+                logger.warning("mem0 flush failed (trigger=%s): %s", trigger, e)
 
-        # Wait for any previous sync before starting a new one
+        # Wait for any previous flush before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
-        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
+        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-flush")
         self._sync_thread.start()
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        # Fires on /new, /branch, /resume AND automatic context-compression
+        # rotation. Any rotation = the old session is done → flush it, then
+        # start accumulating under the new session_id.
+        self._flush_session("switch-reset" if reset else "switch")
+        self._session_id = new_session_id or self._session_id
+        self._turn_count = 0
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        self._flush_session("session-end")
+
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        # Flush right before context compression discards old turns — facts
+        # land in mem0 exactly as they leave the live context.
+        self._flush_session("pre-compress")
+        return ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
@@ -382,6 +539,9 @@ class Mem0MemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def shutdown(self) -> None:
+        # Emergency flush before teardown (redeploy / SIGTERM) so an in-flight
+        # session isn't lost. entrypoint.sh traps TERM/INT → this runs.
+        self._flush_session("shutdown")
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
