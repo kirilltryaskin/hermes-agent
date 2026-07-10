@@ -155,18 +155,12 @@ class GatewaySlashCommandsMixin:
             "session_key": session_key,
         })
 
-        # Resolve session config info to surface to the user
-        try:
-            session_info = self._format_session_info()
-        except Exception:
-            session_info = ""
-
         if new_entry:
-            header = self._telegram_topic_new_header(source) or t("gateway.reset.header_default")
+            header = self._telegram_topic_new_header(source) or t("gateway.reset.header_default", lang="ru")
         else:
             # No existing session, just create one
             new_entry = self.session_store.get_or_create_session(source, force_new=True)
-            header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new")
+            header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new", lang="ru")
 
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
@@ -177,18 +171,18 @@ class GatewaySlashCommandsMixin:
                 sanitized = SessionDB.sanitize_title(_title_arg)
             except ValueError as e:
                 sanitized = None
-                _title_note = t("gateway.reset.title_rejected", error=str(e))
+                _title_note = t("gateway.reset.title_rejected", lang="ru", error=str(e))
             if sanitized:
                 try:
                     self._session_db.set_session_title(new_entry.session_id, sanitized)
-                    header = t("gateway.reset.header_titled", title=sanitized)
+                    header = t("gateway.reset.header_titled", lang="ru", title=sanitized)
                 except ValueError as e:
-                    _title_note = t("gateway.reset.title_error_untitled", error=str(e))
+                    _title_note = t("gateway.reset.title_error_untitled", lang="ru", error=str(e))
                 except Exception:
                     pass
             elif not _title_note:
                 # sanitize_title returned empty (whitespace-only / unprintable)
-                _title_note = t("gateway.reset.title_empty_untitled")
+                _title_note = t("gateway.reset.title_empty_untitled", lang="ru")
         header = header + _title_note
 
         # When /new runs inside a Telegram DM topic lane, rewrite the
@@ -217,16 +211,9 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Append a random tip to the reset message
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
-        except Exception:
-            _tip_line = ""
-
-        if session_info:
-            return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
-        return EphemeralReply(f"{header}{_tip_line}")
+        # Kent overlay: the new-session banner is the header alone — no model
+        # config block, no tips.
+        return EphemeralReply(header)
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show active profile name and home directory."""

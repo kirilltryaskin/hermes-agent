@@ -371,9 +371,10 @@ class TestResetCommandWithTitle:
         runner._session_db.set_session_title.assert_called_once()
         reply = str(result)
         assert "already in use" in reply
-        assert "session started untitled" in reply
+        # Gateway /new banner is Russian (Kent overlay): title-rejection note.
+        assert "сеанс запущен без названия" in reply
         # Header must NOT claim the rejected title as the session name
-        assert "New session started: Dup" not in reply
+        assert "Новая сессия агента создана: Dup" not in reply
 
 
 # ---------------------------------------------------------------------------

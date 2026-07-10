@@ -205,9 +205,9 @@ gateway:
     failed:                "❌ Ошибка перезагрузки навыков: {error}"
 
   reset:
-    header_default:        "✨ Сеанс сброшен! Начинаем с чистого листа."
-    header_new:            "✨ Новый сеанс запущен!"
-    header_titled:         "✨ Новый сеанс запущен: {title}"
+    header_default:        "✨ Новая сессия агента создана."
+    header_new:            "✨ Новая сессия агента создана."
+    header_titled:         "✨ Новая сессия агента создана: {title}"
     title_rejected:        "\n⚠️ Название отклонено: {error}"
     title_error_untitled:  "\n⚠️ {error} — сеанс запущен без названия."
     title_empty_untitled:  "\n⚠️ После очистки название пусто — сеанс запущен без названия."
